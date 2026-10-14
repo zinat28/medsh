@@ -573,7 +573,9 @@ static void free_tokens(Token *t, int n) {
 static int tokenize(const char *line, Token *t, int max) {
     int n = 0;
     const char *p = line;
-    char *buf = malloc(strlen(line) + 1);
+    const char *home = getenv("HOME");
+    /* a word can grow when "~" becomes the home path, so make room for it */
+    char *buf = malloc(strlen(line) + (home ? strlen(home) : 0) + 1);
     if (!buf) return -1;
 
     while (*p) {
@@ -593,6 +595,13 @@ static int tokenize(const char *line, Token *t, int max) {
 
         int len = 0;
         char quote = 0;
+        /* ~ or ~/something at the START of an unquoted word -> $HOME */
+        if (*p == '~' && home &&
+            (p[1] == '/' || p[1] == '\0' || isspace((unsigned char)p[1]) || strchr("|&;<>", p[1]))) {
+            len = (int)strlen(home);
+            memcpy(buf, home, len);
+            p++;
+        }
         while (*p) {
             if (quote) {
                 if (*p == quote) { quote = 0; p++; }

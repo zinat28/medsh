@@ -33,6 +33,7 @@ check "semicolon"             "echo a; echo b"                       $'a\nb'
 check "and (true)"            "true && echo yes"                     "yes"
 check "and (false)"           "false && echo yes"                    ""
 check "or"                    "false || echo fallback"               "fallback"
+check "tilde expansion"       'echo ~'                               "$HOME"
 check "cd + pwd"              "cd /tmp
 pwd"                          "/tmp"
 check "builtin redirect"      "pwd > /tmp/medsh_t1.txt
