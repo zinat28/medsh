@@ -1,3 +1,5 @@
 medsh
 run/
 *.o
+server/classes/
+server/classes/

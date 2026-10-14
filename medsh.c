@@ -21,6 +21,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -265,6 +268,98 @@ static void run_simple(const char *prog, char *const argv[]) {
     if (pid > 0) waitpid(pid, NULL, 0);
 }
 
+/* ---- talking to the Java exam server over TCP (client side of the sockets) ---- */
+
+static int exam_port(void) {
+    const char *p = getenv("MEDSH_EXAM_PORT");
+    int v = p ? atoi(p) : 0;
+    return v > 0 ? v : 5050;
+}
+
+/* socket() + connect(): returns a connected file descriptor, or -1 */
+static int connect_server(void) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(exam_port());
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Send ONE request line, copy the server's reply to `out` (NULL = throw it away).
+ * Returns 0 on success, -1 if the server could not be reached. */
+static int exam_request(const char *req, FILE *out) {
+    int fd = connect_server();
+    if (fd < 0) return -1;
+
+    char line[600];
+    snprintf(line, sizeof line, "%s\n", req);
+    /* MSG_NOSIGNAL: if the server vanished, return an error instead of killing us with SIGPIPE */
+    if (send(fd, line, strlen(line), MSG_NOSIGNAL) < 0) { close(fd); return -1; }
+    shutdown(fd, SHUT_WR);                       /* "I am done sending" -> server closes after replying */
+
+    char buf[1024];
+    ssize_t n;
+    while ((n = recv(fd, buf, sizeof buf, 0)) > 0)
+        if (out) fwrite(buf, 1, (size_t)n, out);
+    close(fd);
+    return 0;
+}
+
+static int exam_ask(const char *req) {
+    if (exam_request(req, stdout) < 0) {
+        printf("cannot reach the exam server on port %d. Is it running? Try: exam start\n", exam_port());
+        return 1;
+    }
+    return 0;
+}
+
+/* N client processes all try to book a seat at DHAKA at (almost) the same instant. */
+static int exam_loadtest(int n) {
+    if (n < 1) n = 1;
+    if (n > 500) n = 500;
+
+    int go[2];
+    if (pipe(go) < 0) { perror("pipe"); return 1; }
+
+    printf("loadtest: %d client processes booking DHAKA at the same time...\n", n);
+    fflush(stdout);
+
+    pid_t pids[500];
+    int started = 0;
+    for (int i = 0; i < n; i++) {
+        pid_t pid = fork();
+        if (pid < 0) { perror("fork"); break; }
+        if (pid == 0) {
+            reset_signals();
+            close(go[1]);
+            char c;
+            read(go[0], &c, 1);                  /* BLOCKS here until the parent closes the pipe */
+            char req[64];
+            snprintf(req, sizeof req, "BOOK DHAKA client%d", i);
+            _exit(exam_request(req, NULL) == 0 ? 0 : 1);
+        }
+        pids[started++] = pid;
+    }
+    close(go[0]);
+    close(go[1]);                                /* closing the write end releases ALL waiting children at once */
+
+    int failures = 0;
+    for (int i = 0; i < started; i++) {
+        int st;
+        waitpid(pids[i], &st, 0);
+        if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) failures++;
+    }
+    printf("loadtest: finished, %d connection failure(s)\n", failures);
+    return exam_ask("STATS") | (failures ? 1 : 0);
+}
+
 static int exam_start(void) {
     int old = read_exam_pid();
     if (exam_alive(old)) {
@@ -274,7 +369,7 @@ static int exam_start(void) {
     mkdir(g_run_dir, 0755);
 
     const char *cmd = getenv("MEDSH_EXAM_CMD");
-    if (!cmd || !*cmd) cmd = "./scripts/fake_exam_server.sh";
+    if (!cmd || !*cmd) cmd = "./scripts/exam_server.sh";
 
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); return 1; }
@@ -293,12 +388,20 @@ static int exam_start(void) {
     }
     FILE *f = fopen(g_pid_file, "w");
     if (f) { fprintf(f, "%d\n", (int)pid); fclose(f); }
-    usleep(200000);                       /* give it a moment to fail fast */
-    if (!exam_alive(pid)) {
-        printf("exam server failed to start. Check: exam logs\n");
-        return 1;
+    /* wait (up to 15 s) until the server process is up AND its port accepts connections */
+    int ready = 0;
+    for (int i = 0; i < 150; i++) {
+        usleep(100000);
+        if (!exam_alive(pid)) {
+            printf("exam server failed to start. Check: exam logs\n");
+            return 1;
+        }
+        int fd = connect_server();
+        if (fd >= 0) { close(fd); ready = 1; break; }
     }
-    printf("exam server started (pid %d)\n", (int)pid);
+    if (ready) printf("exam server started (pid %d), listening on port %d\n", (int)pid, exam_port());
+    else       printf("exam server started (pid %d) but port %d is not answering yet. Check: exam logs\n",
+                      (int)pid, exam_port());
     return 0;
 }
 
@@ -310,9 +413,14 @@ static int exam_stop(void) {
         return 0;
     }
     kill(-pid, SIGTERM);                  /* whole group (server + children) */
-    for (int i = 0; i < 30; i++) {        /* wait up to ~3 s */
+    /* "stopped" means: the process is gone AND its port no longer accepts connections.
+     * (Checking only the pid is not enough: sh can exit while java is still shutting down.) */
+    for (int i = 0; i < 50; i++) {        /* wait up to ~5 s */
         usleep(100000);
-        if (!exam_alive(pid)) break;
+        int fd = connect_server();
+        int port_open = (fd >= 0);
+        if (fd >= 0) close(fd);
+        if (!exam_alive(pid) && !port_open) break;
     }
     if (exam_alive(pid)) {
         printf("server ignored SIGTERM, sending SIGKILL\n");
@@ -329,6 +437,8 @@ static int exam_status(void) {
     int pid = read_exam_pid();
     if (exam_alive(pid)) {
         printf("exam server: RUNNING (pid %d)\n", pid);
+        printf("port       : %d (%s)\n", exam_port(),
+               exam_request("PING", NULL) == 0 ? "answering" : "NOT answering");
         printf("log file   : %s\n", g_log_file);
         return 0;
     }
@@ -347,11 +457,33 @@ static int builtin_exam(Cmd *c) {
         run_simple("tail", av);
         return 0;
     }
-    if (!strcmp(sub, "seats") || !strcmp(sub, "results")) {
-        printf("exam %s: not implemented yet (needs the socket link to the Java server)\n", sub);
+    if (!strcmp(sub, "seats")) return exam_ask("SEATS");
+    if (!strcmp(sub, "stats")) return exam_ask("STATS");
+    if (!strcmp(sub, "reset")) return exam_ask("RESET");
+    if (!strcmp(sub, "ping"))  return exam_ask("PING");
+    if (!strcmp(sub, "mode")) {
+        if (c->argc < 3 || (strcmp(c->argv[2], "safe") && strcmp(c->argv[2], "unsafe"))) {
+            printf("usage: exam mode safe|unsafe\n");
+            return 1;
+        }
+        char req[64];
+        snprintf(req, sizeof req, "MODE %s", c->argv[2]);
+        return exam_ask(req);
+    }
+    if (!strcmp(sub, "book")) {
+        if (c->argc < 3) { printf("usage: exam book <center> [name]\n"); return 1; }
+        char req[300];
+        snprintf(req, sizeof req, "BOOK %s %s", c->argv[2], c->argc > 3 ? c->argv[3] : "anonymous");
+        return exam_ask(req);
+    }
+    if (!strcmp(sub, "loadtest")) return exam_loadtest(c->argc > 2 ? atoi(c->argv[2]) : 40);
+    if (!strcmp(sub, "results")) {
+        printf("exam results: not implemented yet\n");
         return 1;
     }
-    printf("usage: exam start | stop | restart | status | logs [N] | seats | results\n");
+    printf("usage: exam start | stop | restart | status | logs [N]\n"
+           "            seats | book <center> [name] | stats | mode safe|unsafe | reset\n"
+           "            loadtest [N]\n");
     return !strcmp(sub, "help") ? 0 : 1;
 }
 

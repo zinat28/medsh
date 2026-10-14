@@ -84,4 +84,50 @@ for (Login x : LoginManager.getLoginArrayList()) {
 }
 messegeLabel.setText("Login Failed");
 ```
-# medsh
+
+---
+
+# Step 2: real Java server + race-condition demo
+
+New files: `server/ExamServer.java`, `scripts/exam_server.sh`.
+Changed: `medsh.c` (socket client, new `exam` subcommands, `loadtest`), `tests/run_tests.sh`.
+
+Needs Java: `sudo apt install default-jdk`. Add to `.gitignore`: `server/classes/`
+
+## The demo (your 5-minute show)
+
+```
+medsh> exam start                 # compiles + starts the Java server in the background
+medsh> exam seats                 # DHAKA 20 seats, CTG 10, RAJ 10
+medsh> exam book DHAKA zinat      # one booking
+medsh> exam mode unsafe           # turn OFF locking (the bug, on purpose)
+medsh> exam reset
+medsh> exam loadtest 40           # 40 processes book DHAKA at the same instant
+                                  #   -> DHAKA capacity=20 granted=40 OVERBOOKED by 20
+medsh> exam mode safe             # turn ON the semaphore
+medsh> exam reset
+medsh> exam loadtest 40
+                                  #   -> DHAKA capacity=20 granted=20 OK
+medsh> exam stats | grep DHAKA    # works because of your own pipes
+medsh> exam logs 20               # see every client thread in the server log
+medsh> exam stop
+```
+
+## Where each OS concept lives
+
+| Concept | Where |
+|---|---|
+| Thread per client | `ExamServer.main` (`new Thread(...)`) and `handle` |
+| Race condition (check-then-act) | `ExamServer.bookUnsafe` |
+| Counting semaphore (the fix) | `ExamServer.bookSafe` (`Semaphore.tryAcquire`) |
+| Sockets, client side | `medsh.c`: `connect_server`, `exam_request` |
+| Pipe used as a start barrier | `medsh.c`: `exam_loadtest` (children block in `read` until the parent closes the pipe) |
+| Many processes at once | `exam_loadtest` (`fork` x N, `waitpid`) |
+| Detached background daemon | `exam_start` (`setsid`) |
+| Why "stopped" = pid gone AND port closed | `exam_stop` |
+
+## Honest note for your report
+
+`bookUnsafe` sleeps 2 ms between the check and the write to WIDEN the race window,
+so the bug shows up every time. Without the pause the bug is real but rare.
+Say this in your report: it shows you understand that races are timing-dependent.

@@ -55,6 +55,7 @@ fi
 
 # exam commands
 export MEDSH_HOME="$(pwd)"
+export MEDSH_EXAM_PORT=5099      # test-only port
 rm -rf run
 check "exam status stopped"   "exam status"                          "exam server: STOPPED"
 out=$(printf 'exam start\nexam status\nexam stop\nexam status\n' | $SH 2>&1)
@@ -62,6 +63,30 @@ if echo "$out" | grep -q "started" && echo "$out" | grep -q "RUNNING" && echo "$
     echo "PASS  exam start/status/stop"; pass=$((pass+1))
 else
     echo "FAIL  exam start/status/stop"; echo "$out"; fail=$((fail+1))
+fi
+
+
+# ---- Java server + race condition demo (needs: sudo apt install default-jdk) ----
+if command -v javac >/dev/null 2>&1; then
+    rm -rf run
+    out=$(printf 'exam start\nexam seats\nexam book DHAKA tester\nexam book NOWHERE x\nexam stop\nexam seats\n' | $SH 2>&1)
+    if echo "$out" | grep -q "listening on port" && echo "$out" | grep -q "DHAKA  capacity=20" \
+       && echo "$out" | grep -q "OK DHAKA roll=M-" && echo "$out" | grep -q "unknown center" \
+       && echo "$out" | tail -n1 | grep -q "cannot reach"; then
+        echo "PASS  java server: seats, book, errors, stop"; pass=$((pass+1))
+    else
+        echo "FAIL  java server: seats, book, errors, stop"; echo "$out"; fail=$((fail+1))
+    fi
+
+    rm -rf run
+    out=$(printf 'exam start\nexam mode unsafe\nexam reset\nexam loadtest 40\nexam mode safe\nexam reset\nexam loadtest 40\nexam stop\n' | $SH 2>&1)
+    if echo "$out" | grep -q "OVERBOOKED by" && echo "$out" | grep -q "granted=20  *OK"; then
+        echo "PASS  race demo: UNSAFE overbooks, SAFE does not"; pass=$((pass+1))
+    else
+        echo "FAIL  race demo"; echo "$out"; fail=$((fail+1))
+    fi
+else
+    echo "SKIP  java tests (javac not installed)"
 fi
 
 echo "-----"; echo "passed: $pass  failed: $fail"
