@@ -178,12 +178,21 @@ public class ExamServer {
              BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
              PrintWriter out = new PrintWriter(socket.getOutputStream(), true)) {
 
-            String line;
-            while ((line = in.readLine()) != null) {      // null = client closed the connection
+            // ONE request per connection: read one line, answer, close.
+            // (We do not wait for the client to "half-close" its side. Some forwarders,
+            //  like the WSL <-> Windows localhost relay, do not pass that signal on, and the
+            //  client would wait forever for an answer-complete signal.)
+            String line = in.readLine();
+            if (line != null) {
                 String reply = process(line.trim());
-                System.out.println("[server] client-" + id + " > " + line.trim() + "  =>  "
-                        + reply.split("\n")[0]);
+                String word = line.trim().toUpperCase();
+                // the GUI polls SEATS every 2 s: do not flood the log with it
+                if (!word.startsWith("SEATS") && !word.startsWith("PING")) {
+                    System.out.println("[server] client-" + id + " > " + line.trim() + "  =>  "
+                            + reply.split("\n")[0]);
+                }
                 out.println(reply);
+                out.flush();
             }
         } catch (IOException e) {
             System.out.println("[server] client-" + id + " error: " + e.getMessage());
